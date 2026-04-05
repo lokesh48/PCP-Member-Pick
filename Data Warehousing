@@ -1,0 +1,292 @@
+import boto3
+import pandas as pd
+import numpy as np
+import psycopg2
+from sqlalchemy import create_engine
+import pickle
+from datetime import datetime
+
+# ==========================================
+# 1. LOAD NEW ASSIGNMENT REQUESTS
+# ==========================================
+
+s3_client = boto3.client('s3')
+bucket = 'pcp-assignment-data'
+today = datetime.now().strftime('%Y-%m-%d')
+
+# Download today's new member assignments to process
+s3_client.download_file(
+    bucket,
+    f'raw-data/{today}/new_member_assignments.csv',
+    'new_assignments.csv'
+)
+
+df_new = pd.read_csv('new_assignments.csv')
+print(f"Loaded {len(df_new)} new assignment requests")
+
+# ==========================================
+# 2. LOAD MODEL & ENCODERS
+# ==========================================
+
+# Download trained model
+s3_client.download_file(
+    bucket,
+    'models/production/pcp_assignment_classifier_XGBoost.pkl',
+    'model.pkl'
+)
+
+with open('model.pkl', 'rb') as f:
+    model = pickle.load(f)
+
+# Download label encoders
+s3_client.download_file(
+    bucket,
+    'models/encoders/2024-01-15/label_encoders.pkl',
+    'encoders.pkl'
+)
+
+with open('encoders.pkl', 'rb') as f:
+    encoders = pickle.load(f)
+
+print("✓ Model and encoders loaded")
+
+# ==========================================
+# 3. APPLY FEATURE ENGINEERING
+# ==========================================
+
+# Load PCP reference data for joining
+s3_client.download_file(bucket, f'raw-data/{today}/pcp_provider_data.csv', 'pcp_data.csv')
+df_pcp = pd.read_csv('pcp_data.csv')
+
+# Join with PCP data
+df_new = df_new.merge(
+    df_pcp[['PCP_id', 'hmo_typ_cd', 'NTWK_ID', 'EFF_DT', 'Max_Accepted_Age',
+            'Zip_cd', 'Specialty', 'last_update_dt', 'Max_member_count', 'is_active']],
+    on='PCP_id',
+    how='left'
+)
+
+# Apply same feature engineering as training
+# (Copy the exact feature engineering code from STEP 2)
+
+# Convert dates
+df_new['EFF_DT'] = pd.to_datetime(df_new['EFF_DT'])
+df_new['last_update_dt'] = pd.to_datetime(df_new['last_update_dt'])
+
+# Temporal features
+df_new['pcp_tenure_days'] = (pd.Timestamp.now() - df_new['EFF_DT']).dt.days
+df_new['pcp_tenure_years'] = df_new['pcp_tenure_days'] / 365
+df_new['days_since_update'] = (pd.Timestamp.now() - df_new['last_update_dt']).dt.days
+
+# Capacity features
+current_panel = df_pcp.groupby('PCP_id').size().reset_index(name='current_panel_size')
+df_new = df_new.merge(current_panel, on='PCP_id', how='left')
+df_new['utilization_rate'] = df_new['current_panel_size'] / df_new['Max_member_count']
+df_new['available_capacity'] = df_new['Max_member_count'] - df_new['current_panel_size']
+
+# Geographic features
+df_new['zip_prefix'] = df_new['Zip_cd'].astype(str).str[:3]
+pcp_per_zip = df_pcp.groupby('Zip_cd').size().reset_index(name='pcps_in_zip')
+df_new = df_new.merge(pcp_per_zip, on='Zip_cd', how='left')
+
+# Other features
+df_new['is_pediatrician'] = (df_new['Max_Accepted_Age'] < 21).astype(int)
+df_new['is_general_specialty'] = df_new['Specialty'].isin(
+    ['Family Medicine', 'Internal Medicine', 'General Practice']
+).astype(int)
+df_new['is_new_member'] = (df_new['is_New_or_Existing_mem'] == 'New').astype(int)
+df_new['can_use_prior'] = (df_new['is_New_or_Existing_mem'] == 'Existing').astype(int)
+
+# Apply label encoding using saved encoders
+df_new['PCP_id_encoded'] = encoders['PCP_id'].transform(df_new['PCP_id'])
+df_new['NTWK_ID_encoded'] = encoders['NTWK_ID'].transform(df_new['NTWK_ID'])
+df_new['Zip_cd_encoded'] = encoders['Zip_cd'].transform(df_new['Zip_cd'])
+df_new['Specialty_encoded'] = encoders['Specialty'].transform(df_new['Specialty'])
+df_new['hmo_typ_cd_encoded'] = encoders['hmo_typ_cd'].transform(df_new['hmo_typ_cd'])
+
+# Create capacity status bins
+df_new['capacity_status'] = pd.cut(
+    df_new['utilization_rate'],
+    bins=[0, 0.5, 0.8, 0.95, 1.0, float('inf')],
+    labels=['low', 'medium', 'high', 'near_full', 'over_capacity']
+)
+df_new = pd.get_dummies(df_new, columns=['capacity_status'], prefix='cap_status')
+
+# Interaction features
+df_new['specialty_utilization'] = df_new['Specialty_encoded'] * df_new['utilization_rate']
+df_new['new_member_high_util'] = df_new['is_new_member'] * (df_new['utilization_rate'] > 0.8).astype(int)
+
+# ==========================================
+# 4. GENERATE PREDICTIONS
+# ==========================================
+
+# Select exact features used in training (same order!)
+feature_columns = [
+    'PCP_id_encoded', 'NTWK_ID_encoded', 'Zip_cd_encoded',
+    'Specialty_encoded', 'hmo_typ_cd_encoded',
+    'Max_Accepted_Age', 'Max_member_count', 'pcp_tenure_years',
+    'days_since_update', 'utilization_rate', 'available_capacity',
+    'pcps_in_zip', 'is_active', 'is_new_member', 'is_pediatrician',
+    'is_general_specialty', 'can_use_prior', 'specialty_utilization',
+    'new_member_high_util', 'cap_status_low', 'cap_status_medium',
+    'cap_status_high', 'cap_status_near_full', 'cap_status_over_capacity'
+]
+
+X_new = df_new[feature_columns]
+
+# Generate predictions
+predictions = model.predict(X_new)
+prediction_probabilities = model.predict_proba(X_new)
+
+# Get confidence scores (max probability)
+confidence_scores = prediction_probabilities.max(axis=1)
+
+# Add to dataframe
+df_new['recommended_assignment_type'] = predictions
+df_new['confidence_score'] = confidence_scores
+df_new['prediction_date'] = pd.Timestamp.now()
+df_new['model_version'] = 'XGBoost_v1'
+
+print(f"\nPrediction Summary:")
+print(df_new['recommended_assignment_type'].value_counts())
+
+# ==========================================
+# 5. CONNECT TO REDSHIFT
+# ==========================================
+
+redshift_config = {
+    'host': 'pcp-analytics-cluster.abc123.us-east-1.redshift.amazonaws.com',
+    'port': 5439,
+    'database': 'healthcare_analytics',
+    'user': 'admin',
+    'password': 'your-password'  # Use AWS Secrets Manager in production
+}
+
+conn_string = f"postgresql://{redshift_config['user']}:{redshift_config['password']}@" \
+              f"{redshift_config['host']}:{redshift_config['port']}/{redshift_config['database']}"
+
+engine = create_engine(conn_string)
+
+# ==========================================
+# 6. CREATE TABLE IN REDSHIFT
+# ==========================================
+
+create_table_sql = """
+CREATE TABLE IF NOT EXISTS pcp_assignment_recommendations (
+    assignment_request_id VARCHAR(100) PRIMARY KEY,
+    member_id VARCHAR(100),
+    pcp_id VARCHAR(100),
+    pcp_name VARCHAR(200),
+    specialty VARCHAR(100),
+    zip_code VARCHAR(10),
+    recommended_assignment_type VARCHAR(50),
+    confidence_score FLOAT,
+    alternative_type_1 VARCHAR(50),
+    alternative_type_1_probability FLOAT,
+    alternative_type_2 VARCHAR(50),
+    alternative_type_2_probability FLOAT,
+    pcp_utilization_rate FLOAT,
+    pcp_available_capacity INT,
+    is_new_member BOOLEAN,
+    prediction_date TIMESTAMP,
+    model_version VARCHAR(50),
+    actual_assignment_type VARCHAR(50),  -- Filled in after assignment
+    assignment_success BOOLEAN,  -- Did member keep this PCP?
+    days_to_reassignment INT  -- If reassigned, how long did it take?
+)
+SORTKEY(prediction_date)
+DISTKEY(member_id);
+"""
+
+with engine.connect() as conn:
+    conn.execute(create_table_sql)
+    print("✓ Redshift table ready")
+
+# ==========================================
+# 7. PREPARE DATA FOR LOADING
+# ==========================================
+
+# Get top 2 alternative recommendations
+alternative_types_1 = []
+alternative_probs_1 = []
+alternative_types_2 = []
+alternative_probs_2 = []
+
+classes = model.classes_
+
+for i, probs in enumerate(prediction_probabilities):
+    # Sort probabilities
+    sorted_indices = np.argsort(probs)[::-1]
+    
+    # Top alternative (2nd highest probability)
+    alt1_idx = sorted_indices[1]
+    alternative_types_1.append(classes[alt1_idx])
+    alternative_probs_1.append(probs[alt1_idx])
+    
+    # Second alternative (3rd highest probability)
+    alt2_idx = sorted_indices[2]
+    alternative_types_2.append(classes[alt2_idx])
+    alternative_probs_2.append(probs[alt2_idx])
+
+df_new['alternative_type_1'] = alternative_types_1
+df_new['alternative_type_1_probability'] = alternative_probs_1
+df_new['alternative_type_2'] = alternative_types_2
+df_new['alternative_type_2_probability'] = alternative_probs_2
+
+# Select columns for Redshift
+redshift_columns = [
+    'assignment_request_id', 'member_id', 'PCP_id', 'pcp_name', 'Specialty',
+    'Zip_cd', 'recommended_assignment_type', 'confidence_score',
+    'alternative_type_1', 'alternative_type_1_probability',
+    'alternative_type_2', 'alternative_type_2_probability',
+    'utilization_rate', 'available_capacity', 'is_new_member',
+    'prediction_date', 'model_version'
+]
+
+df_to_load = df_new[redshift_columns].rename(columns={
+    'PCP_id': 'pcp_id',
+    'Specialty': 'specialty',
+    'Zip_cd': 'zip_code',
+    'utilization_rate': 'pcp_utilization_rate',
+    'available_capacity': 'pcp_available_capacity'
+})
+
+# ==========================================
+# 8. LOAD TO REDSHIFT
+# ==========================================
+
+df_to_load.to_sql(
+    name='pcp_assignment_recommendations',
+    con=engine,
+    if_exists='append',
+    index=False,
+    method='multi',
+    chunksize=1000
+)
+
+print(f"\n✓ Loaded {len(df_to_load)} recommendations into Redshift")
+
+# ==========================================
+# 9. CREATE VIEW FOR BUSINESS USERS
+# ==========================================
+
+create_view_sql = """
+CREATE OR REPLACE VIEW v_assignment_recommendations_summary AS
+SELECT 
+    DATE(prediction_date) as prediction_date,
+    recommended_assignment_type,
+    COUNT(*) as recommendation_count,
+    AVG(confidence_score) as avg_confidence,
+    AVG(pcp_utilization_rate) as avg_pcp_utilization,
+    SUM(CASE WHEN is_new_member THEN 1 ELSE 0 END) as new_members,
+    SUM(CASE WHEN is_new_member THEN 0 ELSE 1 END) as existing_members
+FROM pcp_assignment_recommendations
+GROUP BY DATE(prediction_date), recommended_assignment_type
+ORDER BY prediction_date DESC, recommendation_count DESC;
+"""
+
+with engine.connect() as conn:
+    conn.execute(create_view_sql)
+    print("✓ Business view created")
+
+print("\n🎉 Predictions loaded successfully!")
