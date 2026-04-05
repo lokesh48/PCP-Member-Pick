@@ -1,0 +1,261 @@
+import boto3
+import pandas as pd
+import psycopg2
+from datetime import datetime, timedelta
+import numpy as np
+
+# ==========================================
+# 1. CONNECT TO REDSHIFT
+# ==========================================
+
+conn = psycopg2.connect(
+    host='pcp-analytics-cluster.abc123.us-east-1.redshift.amazonaws.com',
+    port=5439,
+    database='healthcare_analytics',
+    user='admin',
+    password='your-password'
+)
+
+# ==========================================
+# 2. CALCULATE PERFORMANCE METRICS
+# ==========================================
+
+# Query actual vs predicted assignment types (after assignments are completed)
+performance_query = """
+SELECT 
+    DATE(prediction_date) as date,
+    COUNT(*) as total_predictions,
+    SUM(CASE WHEN recommended_assignment_type = actual_assignment_type 
+        THEN 1 ELSE 0 END) as correct_predictions,
+    AVG(confidence_score) as avg_confidence,
+    SUM(CASE WHEN assignment_success = TRUE THEN 1 ELSE 0 END) as successful_assignments,
+    AVG(days_to_reassignment) as avg_days_to_reassignment
+FROM pcp_assignment_recommendations
+WHERE actual_assignment_type IS NOT NULL
+  AND prediction_date >= CURRENT_DATE - 7
+GROUP BY DATE(prediction_date)
+ORDER BY date DESC;
+"""
+
+df_performance = pd.read_sql(performance_query, conn)
+
+# Calculate accuracy
+df_performance['accuracy'] = (
+    df_performance['correct_predictions'] / df_performance['total_predictions']
+)
+
+# Calculate success rate (did member stay with PCP?)
+df_performance['success_rate'] = (
+    df_performance['successful_assignments'] / df_performance['total_predictions']
+)
+
+print("Last 7 Days Performance:")
+print(df_performance)
+
+# ==========================================
+# 3. BREAKDOWN BY ASSIGNMENT TYPE
+# ==========================================
+
+type_performance_query = """
+SELECT 
+    recommended_assignment_type,
+    COUNT(*) as recommendations,
+    SUM(CASE WHEN recommended_assignment_type = actual_assignment_type 
+        THEN 1 ELSE 0 END)::FLOAT / COUNT(*) as accuracy,
+    AVG(confidence_score) as avg_confidence,
+    SUM(CASE WHEN assignment_success = TRUE THEN 1 ELSE 0 END)::FLOAT / COUNT(*) as success_rate
+FROM pcp_assignment_recommendations
+WHERE actual_assignment_type IS NOT NULL
+  AND prediction_date >= CURRENT_DATE - 30
+GROUP BY recommended_assignment_type
+ORDER BY recommendations DESC;
+"""
+
+df_type_performance = pd.read_sql(type_performance_query, conn)
+
+print("\nPerformance by Assignment Type (Last 30 Days):")
+print(df_type_performance)
+
+# ==========================================
+# 4. DETECT MODEL DRIFT
+# ==========================================
+
+# Get current accuracy
+current_accuracy = df_performance['accuracy'].iloc[0]
+
+# Baseline accuracy from training (assumed 85% from cross-validation)
+baseline_accuracy = 0.85
+drift_threshold = baseline_accuracy * 0.90  # 10% degradation tolerance
+
+print(f"\nModel Drift Analysis:")
+print(f"  Current Accuracy: {current_accuracy:.2%}")
+print(f"  Baseline Accuracy: {baseline_accuracy:.2%}")
+print(f"  Drift Threshold: {drift_threshold:.2%}")
+
+if current_accuracy < drift_threshold:
+    print("  ⚠️ MODEL DRIFT DETECTED - Accuracy below threshold!")
+    drift_detected = True
+else:
+    print("  ✓ Model performing within acceptable range")
+    drift_detected = False
+
+# ==========================================
+# 5. CHECK FOR DATA DISTRIBUTION CHANGES
+# ==========================================
+
+# Compare recent predictions vs training distribution
+recent_dist_query = """
+SELECT 
+    recommended_assignment_type,
+    COUNT(*)::FLOAT / SUM(COUNT(*)) OVER () as recent_proportion
+FROM pcp_assignment_recommendations
+WHERE prediction_date >= CURRENT_DATE - 7
+GROUP BY recommended_assignment_type
+ORDER BY recommended_assignment_type;
+"""
+
+df_recent_dist = pd.read_sql(recent_dist_query, conn)
+
+# Expected distribution from training (example)
+training_distribution = {
+    'auto': 0.45,
+    'choice': 0.28,
+    'family': 0.15,
+    'prior': 0.08,
+    'default': 0.04
+}
+
+print("\nPrediction Distribution Comparison:")
+for _, row in df_recent_dist.iterrows():
+    assignment_type = row['recommended_assignment_type']
+    recent_prop = row['recent_proportion']
+    expected_prop = training_distribution.get(assignment_type, 0)
+    difference = abs(recent_prop - expected_prop)
+    
+    print(f"  {assignment_type}:")
+    print(f"    Recent: {recent_prop:.2%}")
+    print(f"    Expected: {expected_prop:.2%}")
+    print(f"    Difference: {difference:.2%}")
+    
+    if difference > 0.10:  # >10% change
+        print(f"    ⚠️ Significant distribution shift detected!")
+
+# ==========================================
+# 6. LOG METRICS TO CLOUDWATCH
+# ==========================================
+
+cloudwatch = boto3.client('cloudwatch')
+
+# Prepare metrics
+metrics = [
+    {
+        'MetricName': 'ModelAccuracy',
+        'Value': float(current_accuracy),
+        'Unit': 'Percent',
+        'Timestamp': datetime.now()
+    },
+    {
+        'MetricName': 'SuccessRate',
+        'Value': float(df_performance['success_rate'].iloc[0]),
+        'Unit': 'Percent',
+        'Timestamp': datetime.now()
+    },
+    {
+        'MetricName': 'AverageConfidence',
+        'Value': float(df_performance['avg_confidence'].iloc[0]),
+        'Unit': 'None',
+        'Timestamp': datetime.now()
+    },
+    {
+        'MetricName': 'DaysToReassignment',
+        'Value': float(df_performance['avg_days_to_reassignment'].iloc[0]),
+        'Unit': 'None',
+        'Timestamp': datetime.now()
+    },
+    {
+        'MetricName': 'DailyPredictions',
+        'Value': int(df_performance['total_predictions'].iloc[0]),
+        'Unit': 'Count',
+        'Timestamp': datetime.now()
+    }
+]
+
+# Log to CloudWatch
+cloudwatch.put_metric_data(
+    Namespace='PCPAssignment/ModelPerformance',
+    MetricData=metrics
+)
+
+print("\n✓ Metrics logged to CloudWatch")
+
+# ==========================================
+# 7. SEND ALERTS IF NEEDED
+# ==========================================
+
+if drift_detected:
+    sns_client = boto3.client('sns')
+    
+    alert_message = f"""
+    MODEL DRIFT ALERT - PCP Assignment Engine
+    
+    Current Accuracy: {current_accuracy:.2%}
+    Baseline Accuracy: {baseline_accuracy:.2%}
+    Drift Threshold: {drift_threshold:.2%}
+    
+    Performance has degraded below acceptable threshold.
+    
+    Recommended Actions:
+    1. Review recent data quality
+    2. Analyze failed predictions
+    3. Consider model retraining with recent data
+    4. Check for changes in business processes
+    
+    View full metrics in CloudWatch: PCPAssignment/ModelPerformance
+    """
+    
+    sns_client.publish(
+        TopicArn='arn:aws:sns:us-east-1:123456789:model-alerts',
+        Subject='🚨 Model Drift Alert - PCP Assignment Engine',
+        Message=alert_message
+    )
+    
+    print("\n⚠️ Alert sent to SNS topic")
+
+# ==========================================
+# 8. GENERATE PERFORMANCE REPORT
+# ==========================================
+
+report_query = """
+SELECT 
+    recommended_assignment_type,
+    actual_assignment_type,
+    COUNT(*) as count,
+    AVG(confidence_score) as avg_confidence
+FROM pcp_assignment_recommendations
+WHERE prediction_date >= CURRENT_DATE - 30
+  AND actual_assignment_type IS NOT NULL
+GROUP BY recommended_assignment_type, actual_assignment_type
+ORDER BY recommended_assignment_type, count DESC;
+"""
+
+df_confusion = pd.read_sql(report_query, conn)
+
+print("\nConfusion Matrix (Last 30 Days):")
+print(df_confusion)
+
+# Save report to S3
+report_filename = f'performance_report_{datetime.now().strftime("%Y%m%d")}.csv'
+df_confusion.to_csv(report_filename, index=False)
+
+s3_client = boto3.client('s3')
+s3_client.upload_file(
+    report_filename,
+    'pcp-assignment-data',
+    f'monitoring/reports/{report_filename}'
+)
+
+print(f"\n✓ Performance report saved to S3")
+
+conn.close()
+
+print("\n🎉 Monitoring complete!")
