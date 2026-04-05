@@ -1,0 +1,391 @@
+import pandas as pd
+import numpy as np
+import boto3
+import seaborn as sns
+import matplotlib.pyplot as plt
+from datetime import datetime
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+
+# ==========================================
+# 1. LOAD DATA FROM S3
+# ==========================================
+
+s3_client = boto3.client('s3')
+bucket = 'pcp-assignment-data'
+date = '2024-01-15'
+
+# Download files from S3
+s3_client.download_file(bucket, f'raw-data/{date}/pcp_provider_data.csv', 'pcp_data.csv')
+s3_client.download_file(bucket, f'raw-data/{date}/member_assignments.csv', 'assignments.csv')
+s3_client.download_file(bucket, f'raw-data/{date}/assignment_outcomes.csv', 'outcomes.csv')
+
+# Load into DataFrames
+df_pcp = pd.read_csv('pcp_data.csv')
+df_assignments = pd.read_csv('assignments.csv')
+df_outcomes = pd.read_csv('outcomes.csv')
+
+print(f"Loaded {len(df_pcp)} PCP records")
+print(f"Loaded {len(df_assignments)} assignment records")
+
+# ==========================================
+# 2. EXPLORATORY DATA ANALYSIS (EDA)
+# ==========================================
+
+# Understand target distribution
+# Join assignments with outcomes to get successful assignment types
+df_merged = df_assignments.merge(df_outcomes, on='assignment_id', how='inner')
+
+print("\nTarget Distribution (Assignment Process Types):")
+print(df_merged['assignment_process_type'].value_counts())
+# Output example:
+# auto       45000  (most common)
+# choice     28000
+# family     15000
+# prior      8000
+# default    4000
+
+# Check for class imbalance - we'll need to handle this!
+plt.figure(figsize=(10, 6))
+df_merged['assignment_process_type'].value_counts().plot(kind='bar')
+plt.title('Distribution of Assignment Process Types')
+plt.xlabel('Assignment Type')
+plt.ylabel('Count')
+plt.savefig('target_distribution.png')
+
+# Analyze PCP specialty distribution
+print("\nPCP Specialty Distribution:")
+print(df_pcp['Specialty'].value_counts())
+
+# Check age acceptance patterns
+plt.figure(figsize=(10, 6))
+sns.boxplot(data=df_pcp, x='Specialty', y='Max_Accepted_Age')
+plt.xticks(rotation=45)
+plt.title('Age Acceptance by Specialty')
+plt.savefig('age_by_specialty.png')
+
+# Geographic distribution
+top_zips = df_pcp['Zip_cd'].value_counts().head(20)
+print(f"\nTop 20 ZIP codes by PCP count:\n{top_zips}")
+
+# Capacity analysis
+print(f"\nPCP Capacity Statistics:")
+print(df_pcp['Max_member_count'].describe())
+
+# ==========================================
+# 3. DATA QUALITY CHECKS
+# ==========================================
+
+# Check missing values
+print("\n=== Missing Value Analysis ===")
+missing_pcp = df_pcp.isnull().sum()
+print("PCP Data Missing Values:\n", missing_pcp[missing_pcp > 0])
+
+missing_assignments = df_merged.isnull().sum()
+print("\nAssignment Data Missing Values:\n", missing_assignments[missing_assignments > 0])
+
+# Data quality issues to fix
+print("\n=== Data Quality Issues ===")
+
+# 1. Check for inactive PCPs still in assignment records
+inactive_pcp_assignments = df_merged[df_merged['is_active'] == False]
+print(f"Assignments to inactive PCPs: {len(inactive_pcp_assignments)} (should be removed)")
+
+# 2. Check for terminated PCPs
+df_pcp['TRM_DT'] = pd.to_datetime(df_pcp['TRM_DT'], errors='coerce')
+terminated_active = df_pcp[(df_pcp['TRM_DT'].notna()) & (df_pcp['is_active'] == True)]
+print(f"PCPs marked active but have termination date: {len(terminated_active)}")
+
+# 3. Check for capacity violations
+df_merged_pcp = df_merged.merge(df_pcp[['PCP_id', 'Max_member_count']], on='PCP_id')
+pcp_current_load = df_merged.groupby('PCP_id').size().reset_index(name='current_members')
+capacity_check = pcp_current_load.merge(df_pcp[['PCP_id', 'Max_member_count']], on='PCP_id')
+over_capacity = capacity_check[capacity_check['current_members'] > capacity_check['Max_member_count']]
+print(f"PCPs over capacity: {len(over_capacity)}")
+
+# ==========================================
+# 4. DATA CLEANING
+# ==========================================
+
+# Remove assignments to inactive PCPs
+df_merged_clean = df_merged[df_merged['is_active'] == True].copy()
+print(f"\nAfter removing inactive PCPs: {len(df_merged_clean)} records")
+
+# Handle missing values in Max_Accepted_Age (use specialty median)
+df_pcp['Max_Accepted_Age'].fillna(
+    df_pcp.groupby('Specialty')['Max_Accepted_Age'].transform('median'),
+    inplace=True
+)
+
+# Fill missing Max_member_count with median
+df_pcp['Max_member_count'].fillna(df_pcp['Max_member_count'].median(), inplace=True)
+
+# Convert dates
+df_pcp['EFF_DT'] = pd.to_datetime(df_pcp['EFF_DT'])
+df_pcp['last_update_dt'] = pd.to_datetime(df_pcp['last_update_dt'])
+
+# Remove duplicates
+df_merged_clean.drop_duplicates(subset=['assignment_id'], inplace=True)
+
+print(f"After cleaning: {len(df_merged_clean)} records")
+
+# ==========================================
+# 5. FEATURE ENGINEERING
+# ==========================================
+
+# Join PCP data with assignments
+df_final = df_merged_clean.merge(
+    df_pcp[['PCP_id', 'hmo_typ_cd', 'NTWK_ID', 'EFF_DT', 'Max_Accepted_Age', 
+            'Zip_cd', 'Specialty', 'last_update_dt', 'Max_member_count']],
+    on='PCP_id',
+    how='left'
+)
+
+# === TEMPORAL FEATURES ===
+
+# PCP tenure (how long they've been in network)
+df_final['pcp_tenure_days'] = (pd.Timestamp.now() - df_final['EFF_DT']).dt.days
+df_final['pcp_tenure_years'] = df_final['pcp_tenure_days'] / 365
+
+# Data freshness (how recently PCP info was updated)
+df_final['days_since_update'] = (pd.Timestamp.now() - df_final['last_update_dt']).dt.days
+
+# === CAPACITY FEATURES ===
+
+# Calculate current utilization rate for each PCP
+current_panel_size = df_final.groupby('PCP_id').size().reset_index(name='current_panel_size')
+df_final = df_final.merge(current_panel_size, on='PCP_id', how='left')
+
+# Utilization rate (0 to 1)
+df_final['utilization_rate'] = df_final['current_panel_size'] / df_final['Max_member_count']
+
+# Available capacity
+df_final['available_capacity'] = df_final['Max_member_count'] - df_final['current_panel_size']
+
+# Capacity status (categorical)
+df_final['capacity_status'] = pd.cut(
+    df_final['utilization_rate'],
+    bins=[0, 0.5, 0.8, 0.95, 1.0, float('inf')],
+    labels=['low', 'medium', 'high', 'near_full', 'over_capacity']
+)
+
+# === GEOGRAPHIC FEATURES ===
+
+# Extract first 3 digits of ZIP for regional grouping
+df_final['zip_prefix'] = df_final['Zip_cd'].astype(str).str[:3]
+
+# Count PCPs per ZIP code (market density)
+pcp_per_zip = df_pcp.groupby('Zip_cd').size().reset_index(name='pcps_in_zip')
+df_final = df_final.merge(pcp_per_zip, on='Zip_cd', how='left')
+
+# === SPECIALTY FEATURES ===
+
+# Is this a pediatrician? (Max_Accepted_Age < 21)
+df_final['is_pediatrician'] = (df_final['Max_Accepted_Age'] < 21).astype(int)
+
+# Is this a general specialty? (Family Medicine or Internal Medicine)
+general_specialties = ['Family Medicine', 'Internal Medicine', 'General Practice']
+df_final['is_general_specialty'] = df_final['Specialty'].isin(general_specialties).astype(int)
+
+# === MEMBER FEATURES ===
+
+# Member status is already in data: is_New_or_Existing_mem
+# Create derived feature: if existing member, higher chance of 'prior' assignment
+df_final['can_use_prior'] = (df_final['is_New_or_Existing_mem'] == 'Existing').astype(int)
+
+# === NETWORK FEATURES ===
+
+# Count networks each PCP is part of (some PCPs are in multiple networks)
+pcp_network_count = df_pcp.groupby('PCP_id')['NTWK_ID'].nunique().reset_index(name='network_count')
+df_final = df_final.merge(pcp_network_count, on='PCP_id', how='left')
+
+# === HISTORICAL SUCCESS FEATURES ===
+
+# For each PCP, what's their historical success rate with each assignment type?
+success_by_pcp_type = df_merged_clean.groupby(['PCP_id', 'assignment_process_type']).size().reset_index(name='historical_count')
+df_final = df_final.merge(
+    success_by_pcp_type,
+    on=['PCP_id', 'assignment_process_type'],
+    how='left'
+)
+df_final['historical_count'].fillna(0, inplace=True)
+
+# Total assignments per PCP
+total_by_pcp = df_merged_clean.groupby('PCP_id').size().reset_index(name='total_assignments')
+df_final = df_final.merge(total_by_pcp, on='PCP_id', how='left')
+
+# Success rate for this assignment type for this PCP
+df_final['assignment_type_success_rate'] = df_final['historical_count'] / df_final['total_assignments']
+
+# === ENCODING CATEGORICAL VARIABLES ===
+
+# Label encoding for high-cardinality features
+le_pcp = LabelEncoder()
+df_final['PCP_id_encoded'] = le_pcp.fit_transform(df_final['PCP_id'])
+
+le_network = LabelEncoder()
+df_final['NTWK_ID_encoded'] = le_network.fit_transform(df_final['NTWK_ID'])
+
+le_zip = LabelEncoder()
+df_final['Zip_cd_encoded'] = le_zip.fit_transform(df_final['Zip_cd'])
+
+le_specialty = LabelEncoder()
+df_final['Specialty_encoded'] = le_specialty.fit_transform(df_final['Specialty'])
+
+le_hmo = LabelEncoder()
+df_final['hmo_typ_cd_encoded'] = le_hmo.fit_transform(df_final['hmo_typ_cd'])
+
+# One-hot encoding for capacity_status
+df_final = pd.get_dummies(df_final, columns=['capacity_status'], prefix='cap_status')
+
+# Binary encoding
+df_final['is_active_int'] = df_final['is_active'].astype(int)
+df_final['is_new_member'] = (df_final['is_New_or_Existing_mem'] == 'New').astype(int)
+
+# === INTERACTION FEATURES ===
+
+# Specialty-capacity interaction (certain specialties handle capacity differently)
+df_final['specialty_utilization'] = df_final['Specialty_encoded'] * df_final['utilization_rate']
+
+# New member + high utilization (risk factor)
+df_final['new_member_high_util'] = df_final['is_new_member'] * (df_final['utilization_rate'] > 0.8).astype(int)
+
+# ==========================================
+# 6. FINAL FEATURE SELECTION
+# ==========================================
+
+# Select features for model training
+feature_columns = [
+    # Encoded categorical features
+    'PCP_id_encoded', 'NTWK_ID_encoded', 'Zip_cd_encoded', 
+    'Specialty_encoded', 'hmo_typ_cd_encoded',
+    
+    # Numeric features
+    'Max_Accepted_Age', 'Max_member_count', 'pcp_tenure_years',
+    'days_since_update', 'utilization_rate', 'available_capacity',
+    'pcps_in_zip', 'network_count', 'assignment_type_success_rate',
+    
+    # Binary features
+    'is_active_int', 'is_new_member', 'is_pediatrician', 
+    'is_general_specialty', 'can_use_prior',
+    
+    # Interaction features
+    'specialty_utilization', 'new_member_high_util',
+    
+    # One-hot encoded capacity status
+    'cap_status_low', 'cap_status_medium', 'cap_status_high', 
+    'cap_status_near_full', 'cap_status_over_capacity'
+]
+
+# Target variable
+target = 'assignment_process_type'
+
+# Create final dataset
+X = df_final[feature_columns]
+y = df_final[target]
+
+print(f"\nFinal dataset shape: {X.shape}")
+print(f"Number of features: {len(feature_columns)}")
+print(f"Target distribution:\n{y.value_counts()}")
+
+# ==========================================
+# 7. HANDLE CLASS IMBALANCE
+# ==========================================
+
+# Since 'auto' is overrepresented and 'default' is underrepresented,
+# we'll use stratified sampling and class weights in the model
+
+from sklearn.utils.class_weight import compute_class_weight
+
+# Compute class weights
+classes = np.unique(y)
+class_weights = compute_class_weight('balanced', classes=classes, y=y)
+class_weight_dict = dict(zip(classes, class_weights))
+
+print(f"\nClass weights (to handle imbalance):")
+for cls, weight in class_weight_dict.items():
+    print(f"  {cls}: {weight:.2f}")
+
+# ==========================================
+# 8. DATA QUALITY VALIDATION
+# ==========================================
+
+def validate_ml_features(X, y):
+    """
+    Comprehensive validation before model training
+    """
+    issues = []
+    
+    # Check for missing values
+    missing = X.isnull().sum()
+    if missing.sum() > 0:
+        issues.append(f"Missing values: {missing[missing > 0].to_dict()}")
+    
+    # Check for infinite values
+    inf_cols = X.columns[np.isinf(X).any()]
+    if len(inf_cols) > 0:
+        issues.append(f"Infinite values in columns: {list(inf_cols)}")
+    
+    # Check target alignment
+    if len(X) != len(y):
+        issues.append(f"Feature-target mismatch: X has {len(X)} rows, y has {len(y)}")
+    
+    # Check for constant features (no variance)
+    constant_features = X.columns[X.nunique() == 1]
+    if len(constant_features) > 0:
+        issues.append(f"Constant features (remove): {list(constant_features)}")
+    
+    # Check data types
+    non_numeric = X.select_dtypes(exclude=[np.number]).columns
+    if len(non_numeric) > 0:
+        issues.append(f"Non-numeric columns: {list(non_numeric)}")
+    
+    return issues
+
+# Run validation
+validation_issues = validate_ml_features(X, y)
+
+if validation_issues:
+    print("\n⚠️ DATA QUALITY ISSUES DETECTED:")
+    for issue in validation_issues:
+        print(f"  - {issue}")
+else:
+    print("\n✓ All data quality checks passed!")
+
+# ==========================================
+# 9. SAVE PROCESSED DATA
+# ==========================================
+
+# Combine features and target
+df_ml_ready = X.copy()
+df_ml_ready['target'] = y
+
+# Save as Parquet (compressed, efficient)
+output_file = 'pcp_assignment_ml_features.parquet'
+df_ml_ready.to_parquet(output_file, compression='snappy')
+
+# Upload to S3
+s3_client.upload_file(
+    Filename=output_file,
+    Bucket=bucket,
+    Key=f'processed-data/{date}/{output_file}'
+)
+
+print(f"\n✓ Processed data saved to S3: s3://{bucket}/processed-data/{date}/{output_file}")
+
+# Also save encoder mappings for inference
+import pickle
+
+encoders = {
+    'PCP_id': le_pcp,
+    'NTWK_ID': le_network,
+    'Zip_cd': le_zip,
+    'Specialty': le_specialty,
+    'hmo_typ_cd': le_hmo
+}
+
+with open('label_encoders.pkl', 'wb') as f:
+    pickle.dump(encoders, f)
+
+s3_client.upload_file('label_encoders.pkl', bucket, f'models/encoders/{date}/label_encoders.pkl')
+
+print("✓ Label encoders saved to S3")
