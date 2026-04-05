@@ -1,0 +1,55 @@
+import boto3
+from datetime import datetime
+import os
+s3_client = boto3.client('s3')
+BUCKET = 'pcp-assignment-data'
+today = datetime.now().strftime('%Y-%m-%d')
+
+# Source directory where backend drops files
+SOURCE_DIR = '/shared/healthcare-exports/'
+
+def upload_daily_extracts():
+    """
+    Upload PCP and assignment data from backend to S3
+    Partitioned by date for historical tracking
+    """
+    
+    files_to_upload = [
+        'pcp_provider_data.csv',
+        'member_assignments.csv',
+        'network_eligibility.csv',
+        'assignment_outcomes.csv'
+    ]
+    
+    for file_name in files_to_upload:
+        local_path = os.path.join(SOURCE_DIR, file_name)
+        
+        # S3 path with date partitioning
+        s3_key = f'raw-data/{today}/{file_name}'
+        
+        s3_client.upload_file(
+            Filename=local_path,
+            Bucket=BUCKET,
+            Key=s3_key
+        )
+        
+        print(f"✓ Uploaded {file_name} to s3://{BUCKET}/{s3_key}")
+
+upload_daily_extracts()
+
+### **Structure:**
+```
+s3://pcp-assignment-data/
+├── raw-data/                       # Raw backend exports
+│   ├── 2024-01-15/
+│   │   ├── pcp_provider_data.csv
+│   │   ├── member_assignments.csv
+│   │   ├── network_eligibility.csv
+│   │   └── assignment_outcomes.csv
+│   └── 2024-01-16/
+│       └── ...
+├── processed-data/                 # After feature engineering
+│   └── 2024-01-15/
+│       └── ml_features.parquet
+└── models/                         # Trained models
+    └── assignment_classifier_v1.pkl
