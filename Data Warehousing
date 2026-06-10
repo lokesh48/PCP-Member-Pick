@@ -159,7 +159,7 @@ redshift_config = {
     'port': 5439,
     'database': 'healthcare_analytics',
     'user': 'admin',
-    'password': 'your-password'  # Use AWS Secrets Manager in production
+    'password': 'your-password'  
 }
 
 conn_string = f"postgresql://{redshift_config['user']}:{redshift_config['password']}@" \
